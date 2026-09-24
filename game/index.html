@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Orbit Hop</title>
+<style>
+  :root { --bg:#070814; --fg:#e8eaff; --dim:#7a7fa8; --accent:#5ef2d6; --warn:#ff5c8a; --gold:#ffd166; }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  html, body { height:100%; background:var(--bg); color:var(--fg); font-family: system-ui, -apple-system, "Segoe UI", sans-serif; overflow:hidden; touch-action:manipulation; user-select:none; -webkit-user-select:none; }
+  canvas { display:block; width:100vw; height:100vh; }
+  #hud { position:fixed; top:16px; left:0; right:0; display:flex; justify-content:space-between; padding:0 20px; pointer-events:none; font-weight:700; letter-spacing:.05em; }
+  #hud .label { font-size:11px; color:var(--dim); text-transform:uppercase; }
+  #hud .val { font-size:28px; font-variant-numeric:tabular-nums; }
+  #overlay { position:fixed; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:14px; text-align:center; padding:16px; background:radial-gradient(circle, rgba(7,8,20,.55), rgba(7,8,20,.9)); }
+  #overlay.hidden { display:none; }
+  h1 { font-size:clamp(40px, 10vw, 72px); letter-spacing:.04em; background:linear-gradient(90deg, var(--accent), #8a7dff, var(--warn)); -webkit-background-clip:text; background-clip:text; color:transparent; }
+  #overlay p { color:var(--dim); max-width:360px; line-height:1.5; }
+  #overlay .score { font-size:22px; color:var(--fg); }
+  button { margin-top:8px; font:inherit; font-weight:700; font-size:18px; padding:12px 34px; border-radius:999px; border:2px solid var(--accent); background:transparent; color:var(--accent); cursor:pointer; }
+  button:hover { background:var(--accent); color:var(--bg); }
+  kbd { border:1px solid var(--dim); border-radius:4px; padding:1px 6px; font-size:.85em; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hud">
+  <div><div class="label">Score</div><div class="val" id="score">0</div></div>
+  <div style="text-align:right"><div class="label">Best</div><div class="val" id="best">0</div></div>
+</div>
+<div id="overlay">
+  <h1>ORBIT HOP</h1>
+  <p id="msg">Your comet circles a tiny star. Hop between the inner and outer orbit to grab <span style="color:var(--gold)">stardust</span> and dodge <span style="color:var(--warn)">meteors</span>.</p>
+  <p>Tap, click, or press <kbd>Space</kbd> to hop.</p>
+  <div class="score" id="final"></div>
+  <button id="play">Play</button>
+</div>
+<script>
+(() => {
+  const cvs = document.getElementById('c'), ctx = cvs.getContext('2d');
+  const scoreEl = document.getElementById('score'), bestEl = document.getElementById('best');
+  const overlay = document.getElementById('overlay'), finalEl = document.getElementById('final'), playBtn = document.getElementById('play');
+  const TAU = Math.PI * 2;
+  let W, H, cx, cy, R_IN, R_OUT, dpr;
+
+  let best = 0;
+  try { best = +localStorage.getItem('orbithop-best') || 0; } catch (e) {}
+  bestEl.textContent = best;
+
+  function resize() {
+    dpr = Math.min(window.devicePixelRatio || 1, 2);
+    W = innerWidth; H = innerHeight;
+    cvs.width = W * dpr; cvs.height = H * dpr;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    cx = W / 2; cy = H / 2 + 20;
+    const m = Math.min(W, H - 80);
+    R_OUT = m * 0.4; R_IN = m * 0.24;
+  }
+  addEventListener('resize', resize); resize();
+
+  // Background stars
+  const bgStars = Array.from({ length: 140 }, () => ({ x: Math.random(), y: Math.random(), r: Math.random() * 1.4 + .2, t: Math.random() * TAU }));
+
+  let state = 'menu', player, items, particles, score, speed, spawnTimer, time, shake;
+
+  function reset() {
+    player = { a: -Math.PI / 2, ring: 1, r: 0, trail: [] };
+    player.r = R_OUT;
+    items = []; particles = [];
+    score = 0; speed = 1.6; spawnTimer = 0; time = 0; shake = 0;
+    scoreEl.textContent = 0;
+  }
+
+  function hop() {
+    if (state !== 'play') return;
+    player.ring ^= 1;
+    burst(pos(player.a, player.r), '#5ef2d6', 6, 1.5);
+  }
+
+  function pos(a, r) { return { x: cx + Math.cos(a) * r, y: cy + Math.sin(a) * r }; }
+
+  function spawn() {
+    // Spawn ahead of the player, on a random ring
+    const ahead = player.a + Math.PI * (0.9 + Math.random() * 0.6);
+    const ring = Math.random() < .5 ? 0 : 1;
+    const isMeteor = Math.random() < Math.min(0.35 + time * 0.004, 0.62);
+    // Avoid spawning an unwinnable pair (meteors on both rings at same angle)
+    for (const it of items) {
+      if (it.type === 'meteor' && isMeteor && it.ring !== ring && angDist(it.a, ahead) < 0.45) return;
+    }
+    items.push({ a: ahead, ring, type: isMeteor ? 'meteor' : 'dust', life: 0, spin: Math.random() * TAU, drift: isMeteor ? (Math.random() - .5) * 0.25 : 0 });
+  }
+
+  function angDist(a, b) { let d = ((a - b) % TAU + TAU) % TAU; return d > Math.PI ? TAU - d : d; }
+
+  function burst(p, color, n, sp) {
+    for (let i = 0; i < n; i++) {
+      const a = Math.random() * TAU, s = (Math.random() * 2 + .5) * sp;
+      particles.push({ x: p.x, y: p.y, vx: Math.cos(a) * s, vy: Math.sin(a) * s, life: 1, color });
+    }
+  }
+
+  function gameOver() {
+    state = 'over';
+    shake = 18;
+    burst(pos(player.a, player.r), '#ff5c8a', 40, 3);
+    if (score > best) { best = score; try { localStorage.setItem('orbithop-best', best); } catch (e) {} bestEl.textContent = best; }
+    setTimeout(() => {
+      document.getElementById('msg').textContent = score >= best && score > 0 ? 'New best! The cosmos applauds.' : 'Smashed by a meteor. Try again?';
+      finalEl.textContent = 'Score: ' + score;
+      playBtn.textContent = 'Play again';
+      overlay.classList.remove('hidden');
+    }, 700);
+  }
+
+  function start() {
+    reset();
+    overlay.classList.add('hidden');
+    state = 'play';
+  }
+
+  function update(dt) {
+    time += dt;
+    for (const s of bgStars) s.t += dt * 2;
+    particles = particles.filter(p => (p.x += p.vx, p.y += p.vy, p.vx *= .96, p.vy *= .96, (p.life -= dt * 1.4) > 0));
+    if (shake > 0) shake = Math.max(0, shake - dt * 40);
+    if (state !== 'play') return;
+
+    speed = 1.6 + Math.min(time * 0.03, 2.2);
+    const target = player.ring ? R_OUT : R_IN;
+    player.r += (target - player.r) * Math.min(1, dt * 16);
+    // angular speed scaled so linear speed is similar on both rings
+    player.a += dt * speed * (R_OUT / player.r) * 0.75;
+    const p = pos(player.a, player.r);
+    player.trail.push(p); if (player.trail.length > 18) player.trail.shift();
+
+    spawnTimer -= dt;
+    if (spawnTimer <= 0) { spawn(); spawnTimer = Math.max(0.28, 0.75 - time * 0.01) * (0.7 + Math.random() * 0.6); }
+
+    const hitR = Math.max(10, R_OUT * 0.06);
+    items = items.filter(it => {
+      it.life += dt; it.spin += dt * 3; it.a += it.drift * dt;
+      const ip = pos(it.a, it.ring ? R_OUT : R_IN);
+      const d = Math.hypot(ip.x - p.x, ip.y - p.y);
+      if (d < hitR * (it.type === 'meteor' ? 1.25 : 1.6)) {
+        if (it.type === 'meteor') { gameOver(); return false; }
+        score++; scoreEl.textContent = score;
+        burst(ip, '#ffd166', 14, 2);
+        return false;
+      }
+      // player.a grows monotonically, so an item is behind once player.a passes it
+      return player.a < it.a + 0.4;
+    });
+  }
+
+  function draw() {
+    ctx.save();
+    ctx.fillStyle = '#070814'; ctx.fillRect(0, 0, W, H);
+    if (shake) ctx.translate((Math.random() - .5) * shake, (Math.random() - .5) * shake);
+
+    for (const s of bgStars) {
+      ctx.globalAlpha = .35 + Math.sin(s.t) * .3;
+      ctx.fillStyle = '#c9ccff';
+      ctx.beginPath(); ctx.arc(s.x * W, s.y * H, s.r, 0, TAU); ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+
+    // Central star
+    const pulse = 1 + Math.sin(time * 3) * .06;
+    const g = ctx.createRadialGradient(cx, cy, 0, cx, cy, R_IN * .55 * pulse);
+    g.addColorStop(0, '#fff6d6'); g.addColorStop(.35, '#ffb347'); g.addColorStop(1, 'rgba(255,120,60,0)');
+    ctx.fillStyle = g; ctx.beginPath(); ctx.arc(cx, cy, R_IN * .55 * pulse, 0, TAU); ctx.fill();
+
+    // Orbits
+    ctx.lineWidth = 2; ctx.setLineDash([4, 10]);
+    for (const [r, on] of [[R_IN, player && player.ring === 0], [R_OUT, player && player.ring === 1]]) {
+      ctx.strokeStyle = on && state === 'play' ? 'rgba(94,242,214,.45)' : 'rgba(122,127,168,.3)';
+      ctx.beginPath(); ctx.arc(cx, cy, r, 0, TAU); ctx.stroke();
+    }
+    ctx.setLineDash([]);
+
+    const size = Math.max(10, R_OUT * 0.055);
+    if (items) for (const it of items) {
+      const ip = pos(it.a, it.ring ? R_OUT : R_IN);
+      const fade = Math.min(1, it.life * 4);
+      ctx.globalAlpha = fade;
+      if (it.type === 'dust') {
+        ctx.save(); ctx.translate(ip.x, ip.y); ctx.rotate(it.spin);
+        ctx.shadowColor = '#ffd166'; ctx.shadowBlur = 16; ctx.fillStyle = '#ffd166';
+        ctx.beginPath();
+        for (let i = 0; i < 10; i++) { const rr = i % 2 ? size * .4 : size * .9, aa = i * Math.PI / 5; ctx.lineTo(Math.cos(aa) * rr, Math.sin(aa) * rr); }
+        ctx.closePath(); ctx.fill(); ctx.restore();
+      } else {
+        ctx.save(); ctx.translate(ip.x, ip.y); ctx.rotate(it.spin * .4);
+        ctx.shadowColor = '#ff5c8a'; ctx.shadowBlur = 18; ctx.fillStyle = '#ff5c8a';
+        ctx.beginPath();
+        for (let i = 0; i < 8; i++) { const rr = size * (0.85 + ((i * 37) % 5) * 0.07), aa = i * TAU / 8; ctx.lineTo(Math.cos(aa) * rr, Math.sin(aa) * rr); }
+        ctx.closePath(); ctx.fill();
+        ctx.shadowBlur = 0; ctx.fillStyle = '#a8325a';
+        ctx.beginPath(); ctx.arc(size * .25, -size * .2, size * .22, 0, TAU); ctx.fill();
+        ctx.restore();
+      }
+    }
+    ctx.globalAlpha = 1;
+
+    // Player comet
+    if (player && state !== 'over') {
+      player.trail.forEach((t, i) => {
+        const k = i / player.trail.length;
+        ctx.globalAlpha = k * .6; ctx.fillStyle = '#5ef2d6';
+        ctx.beginPath(); ctx.arc(t.x, t.y, size * .6 * k, 0, TAU); ctx.fill();
+      });
+      ctx.globalAlpha = 1;
+      const p = pos(player.a, player.r);
+      ctx.shadowColor = '#5ef2d6'; ctx.shadowBlur = 22; ctx.fillStyle = '#e8fffb';
+      ctx.beginPath(); ctx.arc(p.x, p.y, size * .6, 0, TAU); ctx.fill();
+      ctx.shadowBlur = 0;
+    }
+
+    for (const q of particles) {
+      ctx.globalAlpha = Math.max(0, q.life); ctx.fillStyle = q.color;
+      ctx.fillRect(q.x - 2, q.y - 2, 4, 4);
+    }
+    ctx.restore();
+  }
+
+  let last = performance.now();
+  function loop(now) {
+    const dt = Math.min(0.05, (now - last) / 1000); last = now;
+    update(dt); draw();
+    requestAnimationFrame(loop);
+  }
+
+  reset(); state = 'menu';
+  requestAnimationFrame(loop);
+
+  playBtn.addEventListener('click', e => { e.stopPropagation(); start(); });
+  cvs.addEventListener('pointerdown', e => { e.preventDefault(); hop(); });
+  addEventListener('keydown', e => {
+    if (e.code === 'Space' || e.code === 'ArrowUp' || e.code === 'ArrowDown' || e.code === 'Enter') {
+      e.preventDefault();
+      if (state === 'play') hop(); else if (!overlay.classList.contains('hidden')) start();
+    }
+  });
+})();
+</script>
+</body>
+</html>
