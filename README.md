@@ -1,4 +1,4 @@
-# Orbit Hop
+# Minigame Orbital
 
 **English** | [Português (BR)](README.pt-BR.md)
 
