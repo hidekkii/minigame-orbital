@@ -211,6 +211,12 @@
       const data = await res.json();
       lastInitials = initials;
       try { localStorage.setItem('orbithop-initials', initials); } catch (e) {}
+      if (!data.placed && data.reason === 'best') {
+        // Each initials keeps only its best run, so a lower score doesn't replace it.
+        entryEl.querySelector('label').textContent = `${initials} already has a better score` + (data.best ? ` (${data.best})` : '');
+        renderBoard(data.scores);
+        return;
+      }
       entryEl.classList.add('hidden');
       renderBoard(data.scores, data.id);
       playBtn.focus();

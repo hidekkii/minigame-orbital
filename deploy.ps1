@@ -111,7 +111,7 @@ if ($LASTEXITCODE) {
 }
 $rolePolicy = WriteJson 'role-policy.json' @{
   Version = '2012-10-17'
-  Statement = @(@{ Effect = 'Allow'; Action = @('dynamodb:Query', 'dynamodb:PutItem'); Resource = $tableArn })
+  Statement = @(@{ Effect = 'Allow'; Action = @('dynamodb:Query', 'dynamodb:GetItem', 'dynamodb:PutItem', 'dynamodb:DeleteItem', 'dynamodb:ConditionCheckItem'); Resource = $tableArn })
 }
 Aws iam put-role-policy --role-name $roleName --policy-name scores-table --policy-document $rolePolicy
 if ($newRole) { Start-Sleep -Seconds 10 }  # let the new role propagate before Lambda uses it
