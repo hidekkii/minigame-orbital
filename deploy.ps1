@@ -78,7 +78,128 @@ $policy = WriteJson 'policy.json' @{
 }
 Aws s3api put-bucket-policy --bucket $bucket --policy $policy
 
-# 6. Invalidate on redeploys
+# 6. Leaderboard backend: DynamoDB table + Lambda (function URL, IAM auth) behind CloudFront /api/*
+$table = 'minigame-orbital-scores'
+$fn = 'minigame-orbital-api'
+$roleName = 'minigame-orbital-api-role'
+$distArn = "arn:aws:cloudfront::${account}:distribution/$distId"
+
+& $aws dynamodb describe-table --table-name $table --region $region --profile $awsProfile 2>$null | Out-Null
+if ($LASTEXITCODE) {
+  Aws dynamodb create-table --table-name $table --region $region --billing-mode PAY_PER_REQUEST `
+    --attribute-definitions 'AttributeName=pk,AttributeType=S' 'AttributeName=sk,AttributeType=S' `
+    --key-schema 'AttributeName=pk,KeyType=HASH' 'AttributeName=sk,KeyType=RANGE' | Out-Null
+  Aws dynamodb wait table-exists --table-name $table --region $region
+}
+$tableArn = Aws dynamodb describe-table --table-name $table --region $region --query 'Table.TableArn' --output text
+
+$roleArn = & $aws iam get-role --role-name $roleName --profile $awsProfile --query 'Role.Arn' --output text 2>$null
+$newRole = $false
+if ($LASTEXITCODE) {
+  $trust = WriteJson 'trust.json' @{
+    Version = '2012-10-17'
+    Statement = @(@{
+      Effect = 'Allow'
+      Principal = @{ Service = 'lambda.amazonaws.com' }
+      Action = 'sts:AssumeRole'
+      Condition = @{ StringEquals = @{ 'aws:SourceAccount' = $account } }
+    })
+  }
+  $roleArn = Aws iam create-role --role-name $roleName --assume-role-policy-document $trust --query 'Role.Arn' --output text
+  Aws iam attach-role-policy --role-name $roleName --policy-arn 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+  $newRole = $true
+}
+$rolePolicy = WriteJson 'role-policy.json' @{
+  Version = '2012-10-17'
+  Statement = @(@{ Effect = 'Allow'; Action = @('dynamodb:Query', 'dynamodb:PutItem'); Resource = $tableArn })
+}
+Aws iam put-role-policy --role-name $roleName --policy-name scores-table --policy-document $rolePolicy
+if ($newRole) { Start-Sleep -Seconds 10 }  # let the new role propagate before Lambda uses it
+
+$zip = Join-Path $tmp 'api.zip'
+Compress-Archive -Path api\index.mjs -DestinationPath $zip -Force
+& $aws lambda get-function --function-name $fn --region $region --profile $awsProfile 2>$null | Out-Null
+if ($LASTEXITCODE) {
+  for ($i = 0; $i -lt 6; $i++) {
+    & $aws lambda create-function --function-name $fn --region $region --profile $awsProfile --runtime nodejs22.x `
+      --handler index.handler --role $roleArn --zip-file "fileb://$zip" --memory-size 256 --timeout 10 `
+      --environment "Variables={TABLE_NAME=$table}" 2>$null | Out-Null
+    if (-not $LASTEXITCODE) { break }
+    Start-Sleep -Seconds 5
+  }
+  if ($LASTEXITCODE) { throw "lambda create-function failed" }
+  Aws lambda wait function-active-v2 --function-name $fn --region $region
+} else {
+  Aws lambda update-function-code --function-name $fn --region $region --zip-file "fileb://$zip" | Out-Null
+  Aws lambda wait function-updated-v2 --function-name $fn --region $region
+}
+
+$fnUrl = & $aws lambda get-function-url-config --function-name $fn --region $region --profile $awsProfile --query FunctionUrl --output text 2>$null
+if ($LASTEXITCODE) {
+  $fnUrl = Aws lambda create-function-url-config --function-name $fn --region $region --auth-type AWS_IAM --query FunctionUrl --output text
+}
+$fnDomain = ([Uri]$fnUrl).Host
+
+# Only this CloudFront distribution may call the function URL (needs both permissions).
+$fnPolicy = & $aws lambda get-policy --function-name $fn --region $region --profile $awsProfile --query Policy --output text 2>$null
+if ("$fnPolicy" -notmatch 'CloudFrontInvokeUrl') {
+  Aws lambda add-permission --function-name $fn --region $region --statement-id CloudFrontInvokeUrl `
+    --action lambda:InvokeFunctionUrl --principal cloudfront.amazonaws.com --source-arn $distArn | Out-Null
+}
+if ("$fnPolicy" -notmatch 'CloudFrontInvoke"') {
+  Aws lambda add-permission --function-name $fn --region $region --statement-id CloudFrontInvoke `
+    --action lambda:InvokeFunction --principal cloudfront.amazonaws.com --source-arn $distArn --invoked-via-function-url | Out-Null
+}
+
+$lambdaOacName = "$fn-oac"
+$lambdaOac = (& $aws cloudfront list-origin-access-controls --profile $awsProfile --query "OriginAccessControlList.Items[?Name=='$lambdaOacName'].Id" --output text)
+if (-not $lambdaOac -or $lambdaOac -eq 'None') {
+  $oacCfg = WriteJson 'oac-lambda.json' @{ Name = $lambdaOacName; OriginAccessControlOriginType = 'lambda'; SigningBehavior = 'always'; SigningProtocol = 'sigv4' }
+  $lambdaOac = Aws cloudfront create-origin-access-control --origin-access-control-config $oacCfg --query 'OriginAccessControl.Id' --output text
+}
+
+$current = (& $aws cloudfront get-distribution-config --id $distId --profile $awsProfile --output json) -join "`n" | ConvertFrom-Json
+$cfg = $current.DistributionConfig
+if (-not ($cfg.Origins.Items | Where-Object { $_.Id -eq 'lambda-api' })) {
+  $cfg.Origins.Items = @($cfg.Origins.Items) + @([pscustomobject]@{
+    Id = 'lambda-api'
+    DomainName = $fnDomain
+    OriginPath = ''
+    CustomHeaders = @{ Quantity = 0 }
+    CustomOriginConfig = @{
+      HTTPPort = 80; HTTPSPort = 443; OriginProtocolPolicy = 'https-only'
+      OriginSslProtocols = @{ Quantity = 1; Items = @('TLSv1.2') }
+      OriginReadTimeout = 30; OriginKeepaliveTimeout = 5
+    }
+    ConnectionAttempts = 3
+    ConnectionTimeout = 10
+    OriginShield = @{ Enabled = $false }
+    OriginAccessControlId = $lambdaOac
+  })
+  $cfg.Origins.Quantity = @($cfg.Origins.Items).Count
+  $cfg.CacheBehaviors = [pscustomobject]@{ Quantity = 1; Items = @([pscustomobject]@{
+    PathPattern = '/api/*'
+    TargetOriginId = 'lambda-api'
+    ViewerProtocolPolicy = 'https-only'
+    CachePolicyId = '4135ea2d-6df8-44a3-9df3-4b5a84be39ad'          # Managed-CachingDisabled
+    OriginRequestPolicyId = 'b689b0a8-53d0-40ab-baf2-68738e2966ac'  # Managed-AllViewerExceptHostHeader
+    Compress = $true
+    SmoothStreaming = $false
+    FieldLevelEncryptionId = ''
+    TrustedSigners = @{ Enabled = $false; Quantity = 0 }
+    TrustedKeyGroups = @{ Enabled = $false; Quantity = 0 }
+    LambdaFunctionAssociations = @{ Quantity = 0 }
+    FunctionAssociations = @{ Quantity = 0 }
+    AllowedMethods = @{ Quantity = 7; Items = @('GET','HEAD','OPTIONS','PUT','POST','PATCH','DELETE')
+                        CachedMethods = @{ Quantity = 2; Items = @('GET','HEAD') } }
+  }) }
+  $distUpdate = WriteJson 'dist-update.json' $cfg
+  Aws cloudfront update-distribution --id $distId --if-match $current.ETag --distribution-config $distUpdate | Out-Null
+  Write-Output 'Added /api/* to CloudFront; waiting for it to deploy...'
+  Aws cloudfront wait distribution-deployed --id $distId
+}
+
+# 7. Invalidate on redeploys
 Aws cloudfront create-invalidation --distribution-id $distId --paths '/*' | Out-Null
 
 $domain = Aws cloudfront get-distribution --id $distId --query 'Distribution.DomainName' --output text

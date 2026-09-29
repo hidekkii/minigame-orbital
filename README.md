@@ -18,6 +18,8 @@ Open `game/index.html` in a browser. No build step, no dependencies.
 
 Hosted on a private S3 bucket behind CloudFront (Origin Access Control, HTTPS only).
 
+The global Top 5 leaderboard lives at `/api/scores` on the same CloudFront domain: a Lambda function (`api/index.mjs`, IAM-auth function URL reachable only through CloudFront) backed by a DynamoDB table. Players who make the Top 5 enter 3 initials when the game ends.
+
 ```powershell
 aws login --profile <your-profile>
 powershell -ExecutionPolicy Bypass -File .\deploy.ps1 -AwsProfile <your-profile> -Region <your-region>

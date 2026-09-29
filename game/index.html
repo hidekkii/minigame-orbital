@@ -20,6 +20,24 @@
   button { margin-top:8px; font:inherit; font-weight:700; font-size:18px; padding:12px 34px; border-radius:999px; border:2px solid var(--accent); background:transparent; color:var(--accent); cursor:pointer; }
   button:hover { background:var(--accent); color:var(--bg); }
   kbd { border:1px solid var(--dim); border-radius:4px; padding:1px 6px; font-size:.85em; }
+  #overlay { overflow-y:auto; }
+  #entry { display:flex; flex-direction:column; align-items:center; gap:8px; }
+  #entry.hidden, #board.hidden { display:none; }
+  #entry label { color:var(--gold); font-weight:700; }
+  #entry .row { display:flex; gap:8px; align-items:center; }
+  #initials { width:4.2em; font:inherit; font-size:28px; font-weight:800; letter-spacing:.3em; text-align:center; text-transform:uppercase; padding:6px 0 6px .3em; border-radius:10px; border:2px solid var(--gold); background:rgba(255,209,102,.08); color:var(--fg); user-select:text; -webkit-user-select:text; }
+  #initials:focus { outline:none; box-shadow:0 0 0 3px rgba(255,209,102,.3); }
+  #entry button { margin-top:0; font-size:16px; padding:10px 22px; border-color:var(--gold); color:var(--gold); }
+  #entry button:hover { background:var(--gold); color:var(--bg); }
+  #board { width:min(280px, 100%); }
+  #board h2 { font-size:12px; letter-spacing:.2em; color:var(--dim); text-transform:uppercase; margin-bottom:6px; }
+  #board ol { list-style:none; font-variant-numeric:tabular-nums; }
+  #board li { display:grid; grid-template-columns:2em 1fr auto; gap:8px; padding:5px 12px; border-radius:8px; font-weight:700; }
+  #board li:nth-child(odd) { background:rgba(122,127,168,.1); }
+  #board li.me { background:rgba(94,242,214,.18); color:var(--accent); }
+  #board li .rank { color:var(--dim); text-align:left; }
+  #board li .who { text-align:left; letter-spacing:.15em; }
+  #board .empty { color:var(--dim); font-size:14px; padding:6px; }
 </style>
 </head>
 <body>
@@ -33,6 +51,17 @@
   <p id="msg">Your comet circles a tiny star. Hop between the inner and outer orbit to grab <span style="color:var(--gold)">stardust</span> and dodge <span style="color:var(--warn)">meteors</span>.</p>
   <p>Tap, click, or press <kbd>Space</kbd> to hop.</p>
   <div class="score" id="final"></div>
+  <form id="entry" class="hidden" autocomplete="off">
+    <label for="initials">Top 5! Enter your initials</label>
+    <div class="row">
+      <input id="initials" maxlength="3" inputmode="text" autocapitalize="characters" spellcheck="false" placeholder="AAA">
+      <button type="submit">Save</button>
+    </div>
+  </form>
+  <div id="board">
+    <h2>Top 5</h2>
+    <ol id="boardList"><li class="empty">Loading…</li></ol>
+  </div>
   <button id="play">Play</button>
 </div>
 <script>
@@ -53,7 +82,7 @@
     cvs.width = W * dpr; cvs.height = H * dpr;
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     cx = W / 2; cy = H / 2 + 20;
-    const m = Math.min(W, H - 80);
+    const m = Math.max(80, Math.min(W, H - 80)); // tiny/zero-height viewports would give negative radii
     R_OUT = m * 0.4; R_IN = m * 0.24;
   }
   addEventListener('resize', resize); resize();
@@ -109,9 +138,88 @@
       document.getElementById('msg').textContent = score >= best && score > 0 ? 'New best! The cosmos applauds.' : 'Smashed by a meteor. Try again?';
       finalEl.textContent = 'Score: ' + score;
       playBtn.textContent = 'Play again';
+      entryEl.classList.add('hidden');
       overlay.classList.remove('hidden');
+      const finalScore = score;
+      loadBoard().then(scores => {
+        if (state !== 'over' || !scores || finalScore < 1) return;
+        if (scores.length < 5 || finalScore > scores[scores.length - 1].score) {
+          entryEl.querySelector('label').textContent = 'Top 5! Enter your initials';
+          entryEl.classList.remove('hidden');
+          initialsEl.value = lastInitials;
+          initialsEl.focus();
+          initialsEl.select();
+        }
+      });
     }, 700);
   }
+
+  // ---- Leaderboard (served by /api/scores on the same CloudFront domain) ----
+  const entryEl = document.getElementById('entry'), initialsEl = document.getElementById('initials');
+  const boardList = document.getElementById('boardList');
+  let lastInitials = '';
+  try { lastInitials = localStorage.getItem('orbithop-initials') || ''; } catch (e) {}
+
+  function renderBoard(scores, highlightId) {
+    boardList.replaceChildren();
+    if (!scores) { boardList.innerHTML = '<li class="empty">Leaderboard offline</li>'; return; }
+    if (!scores.length) { boardList.innerHTML = '<li class="empty">No scores yet — be the first!</li>'; return; }
+    scores.forEach((s, i) => {
+      const li = document.createElement('li');
+      if (s.id === highlightId) li.className = 'me';
+      for (const [cls, text] of [['rank', i + 1 + '.'], ['who', s.initials], ['pts', s.score]]) {
+        const span = document.createElement('span'); span.className = cls; span.textContent = text; li.append(span);
+      }
+      boardList.append(li);
+    });
+  }
+
+  async function loadBoard() {
+    try {
+      const res = await fetch('/api/scores', { cache: 'no-store' });
+      if (!res.ok) throw new Error(res.status);
+      const { scores } = await res.json();
+      renderBoard(scores);
+      return scores;
+    } catch (e) { renderBoard(null); return null; }
+  }
+
+  async function sha256Hex(text) {
+    const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
+    return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, '0')).join('');
+  }
+
+  initialsEl.addEventListener('input', () => {
+    initialsEl.value = initialsEl.value.toUpperCase().replace(/[^A-Z]/g, '').slice(0, 3);
+  });
+
+  entryEl.addEventListener('submit', async e => {
+    e.preventDefault();
+    const initials = initialsEl.value;
+    if (!/^[A-Z]{3}$/.test(initials)) { initialsEl.focus(); return; }
+    const btn = entryEl.querySelector('button');
+    btn.disabled = true;
+    try {
+      const body = JSON.stringify({ initials, score });
+      // CloudFront signs requests to the Lambda origin; POST bodies must carry their SHA-256.
+      const res = await fetch('/api/scores', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-amz-content-sha256': await sha256Hex(body) },
+        body,
+      });
+      if (!res.ok) throw new Error(res.status);
+      const data = await res.json();
+      lastInitials = initials;
+      try { localStorage.setItem('orbithop-initials', initials); } catch (e) {}
+      entryEl.classList.add('hidden');
+      renderBoard(data.scores, data.id);
+      playBtn.focus();
+    } catch (err) {
+      entryEl.querySelector('label').textContent = 'Could not save — try again';
+    } finally {
+      btn.disabled = false;
+    }
+  });
 
   function start() {
     reset();
@@ -233,10 +341,12 @@
 
   reset(); state = 'menu';
   requestAnimationFrame(loop);
+  loadBoard();
 
   playBtn.addEventListener('click', e => { e.stopPropagation(); start(); });
   cvs.addEventListener('pointerdown', e => { e.preventDefault(); hop(); });
   addEventListener('keydown', e => {
+    if (e.target === initialsEl) return; // typing initials; Enter submits the form
     if (e.code === 'Space' || e.code === 'ArrowUp' || e.code === 'ArrowDown' || e.code === 'Enter') {
       e.preventDefault();
       if (state === 'play') hop(); else if (!overlay.classList.contains('hidden')) start();

@@ -18,6 +18,8 @@ Abra `game/index.html` no navegador. Não precisa de build nem de dependências.
 
 Hospedado em um bucket S3 privado atrás do CloudFront (Origin Access Control, somente HTTPS).
 
+A tabela de classificação global (Top 5) fica em `/api/scores`, no mesmo domínio do CloudFront: uma função Lambda (`api/index.mjs`, com function URL protegida por IAM e acessível só pelo CloudFront) que grava numa tabela DynamoDB. Quem entra no Top 5 digita 3 iniciais quando o jogo acaba.
+
 ```powershell
 aws login --profile <seu-perfil>
 powershell -ExecutionPolicy Bypass -File .\deploy.ps1 -AwsProfile <seu-perfil> -Region <sua-regiao>
